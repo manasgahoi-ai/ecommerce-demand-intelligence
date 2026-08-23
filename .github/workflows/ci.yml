@@ -1,0 +1,48 @@
+# .github/workflows/ci.yml
+name: CI — Lint and Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install lightgbm pandas numpy pytest sqlfluff \
+                      google-cloud-bigquery faker kafka-python
+
+      - name: Lint Python files
+        run: |
+          pip install flake8
+          flake8 . --max-line-length=100 \
+                   --exclude=venv,__pycache__,.git
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+        if: hashFiles('tests/') != ''
+
+      - name: Validate synthetic generator
+        run: |
+          python synthetic_generator.py --mode preview --preview-count 2
+
+      - name: Validate DAG syntax
+        run: |
+          python -c "
+          import ast
+          with open('demand_intelligence_dag.py') as f:
+              ast.parse(f.read())
+          print('DAG syntax valid')
+          "
