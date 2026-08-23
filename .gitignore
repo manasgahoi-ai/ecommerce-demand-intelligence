@@ -1,0 +1,38 @@
+# Credentials — never commit these
+.env
+credentials.json
+*.json
+!.env.example
+application_default_credentials.json
+*adc*.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Spark
+checkpoints/
+spark-warehouse/
+derby.log
+metastore_db/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter / Databricks
+.ipynb_checkpoints/
+*.ipynb
+
+# Model artifacts — stored in MLflow not git
+*.pkl
+*.model
+models/

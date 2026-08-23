@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────
+# Electronics E-Commerce Demand Intelligence Platform
+# Week 1: Kafka (KRaft mode) local setup
+#
+# KRaft = Kafka Raft — no ZooKeeper needed (Kafka 3.3+)
+# Single broker setup — sufficient for local dev & portfolio demo
+#
+# Start:   docker compose up -d
+# Stop:    docker compose down
+# Logs:    docker compose logs -f kafka
+# Reset:   docker compose down -v  (wipes all data, fresh start)
+#
+# ─────────────────────────────────────────────────────────────────
+# PREREQUISITE (one-time, requires Administrator PowerShell):
+#   Add-Content C:\Windows\System32\drivers\etc\hosts "127.0.0.1 kafka"
+# This maps the Docker service hostname `kafka` to the host's loopback so
+# that the Python producer on Windows can resolve the advertised listener.
+# Without this, port 9092 from the host can't reach the broker because
+# `host.docker.internal` resolves to a VPN NIC on this machine (10.59.102.141).
+# ─────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── KAFKA BROKER (KRaft mode) ─────────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.2
+    container_name: kafka
+    ports:
+      - "9092:9092"       # Python producer on Windows host connects via kafka:9092
+
+    environment:
+      # KRaft identity — this node is both broker AND controller
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # Controller quorum — single node
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # Single PLAINTEXT listener. Advertised as `kafka:9092` — resolvable from
+      # BOTH Windows host (via hosts file entry) AND sibling containers
+      # (via docker network alias).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Cluster ID required for KRaft
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # Reliability settings for single-node setup
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Keep 7 days of events (in case consumer falls behind)
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+      # Don't auto-create topics — we create them explicitly below
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data    # persist data across container restarts
+
+    healthcheck:
+      # Healthcheck runs inside the kafka container itself — uses its own loopback
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+  # ── TOPIC INITIALIZER ─────────────────────────────────────────
+  # Runs once after Kafka is healthy, creates our two topics, then exits.
+  kafka-init:
+    image: apache/kafka:3.7.2
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo '>>> Creating Kafka topics...'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic orders-topic --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic pricing-topic --partitions 2 --replication-factor 1
+        echo '>>> Topics created:'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+        echo '>>> Done. kafka-init container exiting.'
+    # This container exits after setup — that's expected, not an error
+
+
+  # ── KAFKA UI (optional but very useful for debugging) ─────────
+  # Visual dashboard to browse topics, messages, consumer groups
+  # Access at: http://localhost:8080
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local-cluster
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+
+# ── VOLUMES ───────────────────────────────────────────────────────
+volumes:
+  kafka_data:
+    driver: local
