@@ -4,15 +4,14 @@
 Runs a Databricks notebook via REST API.
 Compatible with Databricks Free Edition (serverless compute).
 
-Two execution modes — auto-detected:
-  1. Serverless (Free Edition) → uses /api/2.0/jobs/runs/submit
-     with serverless_compute_config instead of new_cluster
-  2. Classic cluster → falls back if serverless fails
+Databricks Free Edition requires a minimal payload —
+no new_cluster, no queue config. Just notebook_task.
+The platform assigns serverless compute automatically.
 
 Usage:
   python run_databricks_notebook.py \
     --notebook "/Workspace/Users/me@email.com/03_feature_engineering" \
-    --params '{"train_cutoff": "2026-07-16", "run_date": "2026-08-15"}' \
+    --params '{"train_cutoff": "2026-07-16", "run_date": "2026-08-30"}' \
     --timeout 3600
 """
 
@@ -32,25 +31,41 @@ HEADERS = {
 }
 
 
-def submit_serverless(notebook_path: str,
-                      params: dict,
-                      timeout: int) -> str:
+def verify_connection():
+    """Quick auth check before submitting."""
+    response = requests.get(
+        f"{DATABRICKS_HOST}/api/2.0/workspace/list",
+        headers=HEADERS,
+        params={"path": "/"},
+    )
+    if response.status_code != 200:
+        print(f"❌ Auth failed ({response.status_code}): {response.text[:300]}")
+        sys.exit(1)
+    print(f"✅ Connected to {DATABRICKS_HOST}")
+
+
+def submit_run(notebook_path: str, params: dict, timeout: int) -> str:
     """
-    Submit notebook run using serverless compute.
-    Works on Databricks Free Edition.
+    Submit notebook run with minimal payload.
+
+    Databricks Free Edition (serverless) requires NO cluster config.
+    Just notebook_task — the platform assigns compute automatically.
+    Adding new_cluster or queue fields causes 400 Bad Request.
     """
     payload = {
-        "run_name": f"github_actions_{notebook_path.split('/')[-1]}",
+        "run_name":       f"github_actions_{notebook_path.split('/')[-1]}",
         "timeout_seconds": timeout,
         "notebook_task": {
             "notebook_path":   notebook_path,
             "base_parameters": params,
             "source":          "WORKSPACE",
         },
-        # Serverless compute — no cluster config needed
-        # Databricks Free Edition only supports this mode
-        "queue": {"enabled": True},
+        # No new_cluster — Free Edition is serverless only
+        # No queue config — causes 400 on Free Edition
     }
+
+    print(f"  Submitting payload:")
+    print(f"  {json.dumps(payload, indent=2)}")
 
     response = requests.post(
         f"{DATABRICKS_HOST}/api/2.1/jobs/runs/submit",
@@ -58,49 +73,14 @@ def submit_serverless(notebook_path: str,
         json=payload,
     )
 
-    if response.status_code == 200:
-        run_id = response.json()["run_id"]
-        print(f"  Submitted (serverless) run_id: {run_id}")
-        return run_id
+    # Always print response body — critical for debugging 400 errors
+    print(f"  Response status: {response.status_code}")
+    if response.status_code != 200:
+        print(f"  Response body: {response.text[:500]}")
+        response.raise_for_status()
 
-    # If serverless fails, try classic cluster config
-    print(f"  Serverless submit failed ({response.status_code}), "
-          f"trying classic cluster...")
-    return submit_classic(notebook_path, params, timeout)
-
-
-def submit_classic(notebook_path: str,
-                   params: dict,
-                   timeout: int) -> str:
-    """
-    Fallback: submit with classic cluster config.
-    Used when running on paid Databricks tier.
-    """
-    payload = {
-        "run_name": f"github_actions_{notebook_path.split('/')[-1]}",
-        "timeout_seconds": timeout,
-        "notebook_task": {
-            "notebook_path":   notebook_path,
-            "base_parameters": params,
-            "source":          "WORKSPACE",
-        },
-        "new_cluster": {
-            "spark_version":    "14.3.x-scala2.12",
-            "node_type_id":     "i3.xlarge",
-            "num_workers":      0,
-            "spark_conf":       {"spark.master": "local[*]"},
-            "runtime_engine":   "STANDARD",
-        }
-    }
-
-    response = requests.post(
-        f"{DATABRICKS_HOST}/api/2.1/jobs/runs/submit",
-        headers=HEADERS,
-        json=payload,
-    )
-    response.raise_for_status()
     run_id = response.json()["run_id"]
-    print(f"  Submitted (classic cluster) run_id: {run_id}")
+    print(f"  ✅ Submitted run_id: {run_id}")
     return run_id
 
 
@@ -108,7 +88,6 @@ def poll_run(run_id: str, poll_interval: int = 30) -> bool:
     """
     Poll run status until complete.
     Returns True if success, False if failed.
-    Prints detailed error on failure.
     """
     start_time = time.time()
 
@@ -127,14 +106,20 @@ def poll_run(run_id: str, poll_interval: int = 30) -> bool:
         msg   = state.get("state_message", "")
 
         elapsed = int(time.time() - start_time)
-        print(f"  [{elapsed:>4}s] {lc} {rs} {msg[:60] if msg else ''}")
+        status_line = f"[{elapsed:>4}s] {lc}"
+        if rs:
+            status_line += f" | {rs}"
+        if msg:
+            status_line += f" | {msg[:80]}"
+        print(f"  {status_line}")
 
         if lc in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
             if rs == "SUCCESS":
-                print(f"  ✅ Run {run_id} completed successfully ({elapsed}s)")
+                print(f"  ✅ Completed successfully ({elapsed}s)")
                 return True
-            else:
-                # Get notebook output for debugging
+
+            # Fetch notebook output for detailed error message
+            try:
                 output_response = requests.get(
                     f"{DATABRICKS_HOST}/api/2.1/jobs/runs/get-output",
                     headers=HEADERS,
@@ -143,31 +128,23 @@ def poll_run(run_id: str, poll_interval: int = 30) -> bool:
                 if output_response.status_code == 200:
                     output = output_response.json()
                     error  = output.get("error", "")
+                    trace  = output.get("error_trace", "")
                     if error:
-                        print(f"\n  ❌ Notebook error:\n{error[:500]}")
+                        print(f"\n  ❌ Notebook error: {error[:500]}")
+                    if trace:
+                        print(f"  Traceback (last 500 chars):\n  {trace[-500:]}")
+            except Exception:
+                pass
 
-                print(f"  ❌ Run {run_id} failed after {elapsed}s: {rs} — {msg}")
-                return False
+            print(f"  ❌ Run failed after {elapsed}s: {rs} — {msg}")
+            return False
 
         time.sleep(poll_interval)
 
 
-def verify_connection():
-    """Quick auth check before submitting."""
-    response = requests.get(
-        f"{DATABRICKS_HOST}/api/2.0/workspace/list",
-        headers=HEADERS,
-        params={"path": "/"},
-    )
-    if response.status_code != 200:
-        print(f"❌ Auth failed ({response.status_code}): {response.text[:200]}")
-        sys.exit(1)
-    print(f"✅ Connected to {DATABRICKS_HOST}")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a Databricks notebook via REST API"
+        description="Run a Databricks notebook via REST API (Free Edition compatible)"
     )
     parser.add_argument("--notebook", required=True,
                         help="Workspace path to notebook")
@@ -192,11 +169,11 @@ def main():
 
     verify_connection()
 
-    run_id  = submit_serverless(notebook, params, timeout)
+    run_id  = submit_run(notebook, params, timeout)
     success = poll_run(run_id, poll_interval=poll)
 
     if not success:
-        sys.exit(1)    # GitHub Actions marks step as failed
+        sys.exit(1)
 
 
 if __name__ == "__main__":
