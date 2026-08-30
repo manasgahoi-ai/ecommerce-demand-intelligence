@@ -1,114 +1,178 @@
-# .github/workflows/ml_pipeline.yml
 name: ML Pipeline — Daily Training
 
+# ─────────────────────────────────────────────────────────────────
+# Triggers:
+#   - Cron: daily at 2:00 AM IST (20:30 UTC)
+#   - Manual: workflow_dispatch with optional run_date override
+#   - Push: only when ML-related files change (for testing)
+# ─────────────────────────────────────────────────────────────────
 on:
   schedule:
-    - cron: "30 20 * * *" # 2:00 AM IST = 20:30 UTC
-  workflow_dispatch: # allow manual trigger from GitHub UI
+    - cron: "30 20 * * *"
+
+  workflow_dispatch:
     inputs:
       run_date:
-        description: "Run date (YYYY-MM-DD) — leave empty for today"
+        description: "Run date YYYY-MM-DD (leave empty for today)"
         required: false
+        default: ""
+      force_retrain:
+        description: "Force retrain even if no alerts"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+  push:
+    branches: [main]
+    paths:
+      - "databricks/notebooks/**.py"
+      - ".github/scripts/run_databricks_notebook.py"
 
 env:
-  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
   DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-  GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+  GCP_PROJECT:      ${{ secrets.GCP_PROJECT }}
+  PYTHON_VERSION:   "3.11"
+
+  # ── UPDATE THESE to match your Databricks workspace paths ──────
+  # Find paths in Databricks: right-click notebook → Copy Path
+  NB_DATA_QUALITY:  "/Workspace/Users/manasgahoi@gmail.com/00_data_quality_check"
+  NB_FEATURES:      "/Workspace/Users/manasgahoi@gmail.com/03_feature_engineering"
+  NB_TRAINING:      "/Workspace/Users/manasgahoi@gmail.com/04_lightgbm_training"
+  NB_MONITORING:    "/Workspace/Users/manasgahoi@gmail.com/05_validation_monitoring"
+  NB_POST_ACTION:   "/Workspace/Users/manasgahoi@gmail.com/06_post_monitoring_action"
 
 jobs:
   ml_pipeline:
+    name: "ML Pipeline Run"
     runs-on: ubuntu-latest
-    timeout-minutes: 240 # 4 hour max for full pipeline
+    timeout-minutes: 240
 
     steps:
-      - uses: actions/checkout@v4
+      # ── Setup ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install Databricks CLI
-        run: pip install databricks-sdk
+      - name: Install runner dependencies
+        run: pip install requests
 
-      - name: Set run date
-        id: set_date
+      # ── Date calculation ────────────────────────────────────────
+      - name: Calculate run dates
+        id: dates
         run: |
+          # Use manual input or today
           if [ -n "${{ github.event.inputs.run_date }}" ]; then
             RUN_DATE="${{ github.event.inputs.run_date }}"
           else
             RUN_DATE=$(date -u +"%Y-%m-%d")
           fi
-          TRAIN_CUTOFF=$(date -u -d "$RUN_DATE - 30 days" +"%Y-%m-%d" 2>/dev/null \
-                      || date -u -v-30d +"%Y-%m-%d")
-          echo "run_date=$RUN_DATE"        >> $GITHUB_OUTPUT
+
+          # Train cutoff = 30 days before run date
+          # Works on both Linux (GNU date) and macOS (BSD date)
+          TRAIN_CUTOFF=$(python3 -c "
+          from datetime import datetime, timedelta
+          run_date = datetime.strptime('$RUN_DATE', '%Y-%m-%d')
+          cutoff   = run_date - timedelta(days=30)
+          print(cutoff.strftime('%Y-%m-%d'))
+          ")
+
+          echo "run_date=$RUN_DATE"         >> $GITHUB_OUTPUT
           echo "train_cutoff=$TRAIN_CUTOFF" >> $GITHUB_OUTPUT
-          echo "Run date: $RUN_DATE | Train cutoff: $TRAIN_CUTOFF"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Run date:     $RUN_DATE"
+          echo "  Train cutoff: $TRAIN_CUTOFF"
+          echo "  Trigger:      ${{ github.event_name }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       # ── Task 1: Data Quality Check ──────────────────────────────
       - name: "Task 1 — Data Quality Check"
         id: data_quality
         run: |
           python .github/scripts/run_databricks_notebook.py \
-            --notebook "/Workspace/Users/manasgahoi@gmail.com/00_data_quality_check" \
-            --params '{"run_date": "${{ steps.set_date.outputs.run_date }}"}'
+            --notebook "${{ env.NB_DATA_QUALITY }}" \
+            --params "{\"run_date\": \"${{ steps.dates.outputs.run_date }}\"}" \
+            --timeout 600
 
       # ── Task 2: Feature Engineering ─────────────────────────────
+      # Only runs if data quality passed (default GitHub Actions behaviour)
       - name: "Task 2 — Feature Engineering"
         id: feature_eng
         run: |
           python .github/scripts/run_databricks_notebook.py \
-            --notebook "/Workspace/Users/manasgahoi@gmail.com/03_feature_engineering" \
-            --params '{
-              "run_date":     "${{ steps.set_date.outputs.run_date }}",
-              "train_cutoff": "${{ steps.set_date.outputs.train_cutoff }}"
-            }'
+            --notebook "${{ env.NB_FEATURES }}" \
+            --params "{
+              \"train_cutoff\": \"${{ steps.dates.outputs.train_cutoff }}\",
+              \"run_date\":     \"${{ steps.dates.outputs.run_date }}\"
+            }" \
+            --timeout 3600
 
       # ── Task 3: Model Training ───────────────────────────────────
-      - name: "Task 3 — LightGBM Training"
+      - name: "Task 3 — LightGBM Training + MLflow"
         id: model_training
         run: |
           python .github/scripts/run_databricks_notebook.py \
-            --notebook "/Workspace/Users/manasgahoi@gmail.com/04_lightgbm_training" \
-            --params '{
-              "run_date":       "${{ steps.set_date.outputs.run_date }}",
-              "train_cutoff":   "${{ steps.set_date.outputs.train_cutoff }}",
-              "optuna_trials":  "20",
-              "promotion_gate": "0.02"
-            }' \
+            --notebook "${{ env.NB_TRAINING }}" \
+            --params "{
+              \"train_cutoff\":   \"${{ steps.dates.outputs.train_cutoff }}\",
+              \"run_date\":       \"${{ steps.dates.outputs.run_date }}\",
+              \"optuna_trials\":  \"20\",
+              \"promotion_gate\": \"0.02\"
+            }" \
             --timeout 7200
 
-      # ── Task 4: Validation + Monitoring ─────────────────────────
-      - name: "Task 4 — Validation and Monitoring"
+      # ── Task 4: Validation + SHAP + Evidently ───────────────────
+      - name: "Task 4 — Validation, SHAP, Drift Detection"
         id: validation
         run: |
           python .github/scripts/run_databricks_notebook.py \
-            --notebook "/Workspace/Users/manasgahoi@gmail.com/05_validation_monitoring" \
-            --params '{
-              "run_date":              "${{ steps.set_date.outputs.run_date }}",
-              "wmape_warn_threshold":  "25.0",
-              "wmape_alert_threshold": "35.0",
-              "drift_threshold":       "0.5"
-            }'
+            --notebook "${{ env.NB_MONITORING }}" \
+            --params "{
+              \"run_date\":              \"${{ steps.dates.outputs.run_date }}\",
+              \"wmape_warn_threshold\":  \"25.0\",
+              \"wmape_alert_threshold\": \"35.0\",
+              \"drift_threshold\":       \"0.5\"
+            }" \
+            --timeout 3600
 
       # ── Task 5: Post-monitoring action ───────────────────────────
-      - name: "Task 5 — Check Alerts"
-        id: check_alerts
+      - name: "Task 5 — Check Alerts, Branch on Action"
+        id: post_action
         run: |
           python .github/scripts/run_databricks_notebook.py \
-            --notebook "/Workspace/Users/manasgahoi@gmail.com/06_post_monitoring_action" \
-            --params '{"run_date": "${{ steps.set_date.outputs.run_date }}"}'
+            --notebook "${{ env.NB_POST_ACTION }}" \
+            --params "{\"run_date\": \"${{ steps.dates.outputs.run_date }}\"}" \
+            --timeout 600
 
-      # ── Notifications ────────────────────────────────────────────
-      - name: "Pipeline Success"
+      # ── Pipeline outcome notifications ───────────────────────────
+      - name: "✅ Pipeline Success Summary"
         if: success()
         run: |
-          echo "✅ ML Pipeline completed successfully"
-          echo "Run date: ${{ steps.set_date.outputs.run_date }}"
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║   ML PIPELINE COMPLETED SUCCESSFULLY     ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "║  Run date:     ${{ steps.dates.outputs.run_date }}"
+          echo "║  Cutoff:       ${{ steps.dates.outputs.train_cutoff }}"
+          echo "║  Trigger:      ${{ github.event_name }}"
+          echo "║  Run URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "╚══════════════════════════════════════════╝"
 
-      - name: "Pipeline Failed"
+      - name: "❌ Pipeline Failure Summary"
         if: failure()
         run: |
-          echo "❌ ML Pipeline FAILED"
-          echo "Check logs above for the failing step"
-          # In production: add Slack webhook notification here
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║   ML PIPELINE FAILED                     ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "║  Failed step: check logs above           ║"
+          echo "║  Run date:   ${{ steps.dates.outputs.run_date }}"
+          echo "║  Run URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "╚══════════════════════════════════════════╝"
+          # Add Slack/email webhook here in production
